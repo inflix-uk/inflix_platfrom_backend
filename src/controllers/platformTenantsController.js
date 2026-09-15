@@ -12,7 +12,7 @@ const tenantUserSchema = require('../models/tenantUserSchema');
 const tenantRoleSchema = require('../models/tenantRoleSchema');
 const { seedTenantRbac } = require('../seeders/seedTenantRbac');
 const { validatePassword } = require('../utils/passwordPolicy');
-const { mapToObject } = require('../services/entitlementsService');
+const { mapToObject, normalizeSalesInvoiceMutex } = require('../services/entitlementsService');
 
 /** URL-safe short tenant ID (e.g. ab12cd). Never accept dbName from request. */
 function generateTenantId() {
@@ -521,9 +521,23 @@ exports.getSubscription = asyncHandler(async (req, res) => {
 /** Update subscription */
 exports.updateSubscription = asyncHandler(async (req, res) => {
     const { tenantId } = req.params;
-    const { planKey, overrides, startDate, expireDate, subscriptionType } = req.body;
+    const { planKey, overrides, startDate, expireDate, subscriptionType, salesInvoiceMode } = req.body;
     console.log('[updateSubscription] tenantId:', tenantId);
     console.log('[updateSubscription] req.body:', JSON.stringify(req.body, null, 2));
+
+    // If the caller sent a salesInvoiceMode ("none" | "sales" | "invoices"),
+    // translate it into overrides.features so the dropdown is the single source of truth.
+    const incomingFeatures = (overrides && typeof overrides.features === 'object') ? { ...overrides.features } : null;
+    let preferKey;
+    if (typeof salesInvoiceMode === 'string') {
+        const mode = salesInvoiceMode.toLowerCase();
+        if (mode === 'sales') { if (incomingFeatures) { incomingFeatures.sales = true; incomingFeatures.invoices = false; } preferKey = 'sales'; }
+        else if (mode === 'invoices' || mode === 'invoice') { if (incomingFeatures) { incomingFeatures.sales = false; incomingFeatures.invoices = true; } preferKey = 'invoices'; }
+        else if (mode === 'none') { if (incomingFeatures) { incomingFeatures.sales = false; incomingFeatures.invoices = false; } }
+    }
+    if (incomingFeatures) normalizeSalesInvoiceMutex(incomingFeatures, preferKey);
+    console.log(`[updateSubscription][sales/invoice] tenantId=${tenantId} mode=${salesInvoiceMode || '(unset)'} preferKey=${preferKey || '(none)'} overrides={sales:${incomingFeatures?.sales}, invoices:${incomingFeatures?.invoices}}`);
+
     let sub = await TenantSubscription.findOne({ tenantId });
     const before = sub ? sub.toObject() : null;
     if (!sub) {
@@ -532,14 +546,14 @@ exports.updateSubscription = asyncHandler(async (req, res) => {
             tenantId,
             subscriptionType: subscriptionType === 'custom' ? 'custom' : 'plan',
             planKey: subscriptionType === 'custom' ? '' : (planKey || 'starter').trim().toLowerCase(),
-            overrides: { features: (overrides && overrides.features) || {}, limits: (overrides && overrides.limits) || {} },
+            overrides: { features: incomingFeatures || {}, limits: (overrides && overrides.limits) || {} },
             startDate: startDate ? new Date(startDate) : now,
             expireDate: expireDate ? new Date(expireDate) : null
         });
     } else {
         if (subscriptionType !== undefined) sub.subscriptionType = subscriptionType === 'custom' ? 'custom' : 'plan';
         if (planKey !== undefined) sub.planKey = (planKey || '').trim().toLowerCase();
-        if (overrides && typeof overrides.features === 'object') sub.overrides.features = overrides.features;
+        if (incomingFeatures) sub.overrides.features = incomingFeatures;
         if (overrides && typeof overrides.limits === 'object') sub.overrides.limits = overrides.limits;
         if (startDate !== undefined) sub.startDate = startDate ? new Date(startDate) : null;
         if (expireDate !== undefined) sub.expireDate = expireDate ? new Date(expireDate) : null;
@@ -576,6 +590,7 @@ exports.updateSubscription = asyncHandler(async (req, res) => {
                 { upsert: true }
             );
             console.log('[updateSubscription] Synced subscription + entitlements to tenant DB:', tenantId);
+            console.log(`[updateSubscription][sales/invoice] tenantId=${tenantId} effective={sales:${entitlements.enabledFeatures.sales}, invoices:${entitlements.enabledFeatures.invoices}} -> written to tenant_${tenantId}.subscription.effective.enabledFeatures`);
         }
     } catch (syncErr) {
         console.error('[updateSubscription] Failed to sync to tenant DB:', syncErr.message);

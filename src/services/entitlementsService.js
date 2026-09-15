@@ -15,6 +15,33 @@ function mapToObject(m) {
     return {};
 }
 
+/**
+ * Sales and Invoices are mutually exclusive. At most one may be true.
+ * Behaviour:
+ *  - If both are true, the value passed in `preferKey` wins (the one the caller just turned on).
+ *    When unspecified, `invoices` wins (last-write-wins toward the more constrained flow).
+ *  - If only one is true, the other is forced to false.
+ *  - If both are false / undefined, both are left as-is.
+ * Mutates and returns the same object.
+ */
+function normalizeSalesInvoiceMutex(features, preferKey) {
+    if (!features || typeof features !== 'object') return features;
+    const sales = features.sales === true;
+    const invoices = features.invoices === true;
+    if (sales && invoices) {
+        if (preferKey === 'sales') {
+            features.invoices = false;
+        } else {
+            features.sales = false;
+        }
+    } else if (sales) {
+        features.invoices = false;
+    } else if (invoices) {
+        features.sales = false;
+    }
+    return features;
+}
+
 async function getEntitlements(tenantId) {
     const tid = tenantId || 'default';
     const [subscription, featureCatalog, limitCatalog] = await Promise.all([
@@ -39,6 +66,19 @@ async function getEntitlements(tenantId) {
             enabledFeatures[f.key] = !!f.defaultEnabled;
         }
     });
+
+    // `sales` and `invoices` are first-class mutex features. Always emit explicit booleans
+    // even if the FeatureCatalog hasn't been seeded with them yet (so the POS sidebar can
+    // hide the relevant tabs reliably).
+    for (const key of ['sales', 'invoices']) {
+        if (overrideFeatures[key] !== undefined) enabledFeatures[key] = !!overrideFeatures[key];
+        else if (planFeatures[key] !== undefined) enabledFeatures[key] = !!planFeatures[key];
+        else if (enabledFeatures[key] === undefined) enabledFeatures[key] = false;
+    }
+
+    const beforeMutex = { sales: enabledFeatures.sales, invoices: enabledFeatures.invoices };
+    normalizeSalesInvoiceMutex(enabledFeatures);
+    console.log(`[entitlementsService][sales/invoice] tenantId=${tid} planKey=${planKey} overrides={sales:${overrideFeatures.sales}, invoices:${overrideFeatures.invoices}} plan={sales:${planFeatures.sales}, invoices:${planFeatures.invoices}} preMutex=${JSON.stringify(beforeMutex)} postMutex={sales:${enabledFeatures.sales}, invoices:${enabledFeatures.invoices}}`);
 
     const limits = {};
     limitCatalog.forEach((l) => {
@@ -72,5 +112,6 @@ async function getUsage(tenantId) {
 module.exports = {
     getEntitlements,
     getUsage,
-    mapToObject
+    mapToObject,
+    normalizeSalesInvoiceMutex
 };
